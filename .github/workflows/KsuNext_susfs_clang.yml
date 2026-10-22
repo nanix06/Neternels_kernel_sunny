@@ -1,4 +1,4 @@
-name: Mojito - NetErnels-KSUNext-susfs-clang
+name: clang-NetErnels-KSUNext-susfs-clang
 
 on:
   workflow_dispatch:
