@@ -1,0 +1,160 @@
+name: Mojito - NetErnels-KSUNext-susfs-clang
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_version:
+        description: "Version de clang/LLVM (ex: 21, 22, 23)"
+        required: true
+        default: "23"
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  DEFCONFIG: neternels_defconfig
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+  CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+  CLANG_VER: ${{ inputs.clang_version || '23' }}
+  MAKE_ARGS: >-
+    CC=clang
+    HOSTCC=clang
+    HOSTCXX=clang++
+    LD=ld.lld
+    HOSTLD=ld.lld
+    AR=llvm-ar
+    NM=llvm-nm
+    OBJCOPY=llvm-objcopy
+    OBJDUMP=llvm-objdump
+    READELF=llvm-readelf
+    STRIP=llvm-strip
+    CLANG_TRIPLE=aarch64-linux-gnu-
+    CROSS_COMPILE=aarch64-linux-gnu-
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+    CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+    LLVM_IAS=1
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Télécharger le source
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Installer les dépendances
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache flex git libssl-dev \
+            libelf-dev pahole python3 rsync unzip wget zip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi \
+            lsb-release software-properties-common gnupg
+
+      - name: Installer Clang (apt.llvm.org)
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$CLANG_VER" all
+          sudo apt-get install -y "lld-$CLANG_VER" "llvm-$CLANG_VER"
+          rm -f llvm.sh
+
+          # Liens sans suffixe : le Makefile du kernel appelle "llvm-ar", "ld.lld"... en dur
+          for t in clang clang++ clang-cpp ld.lld lld llvm-ar llvm-nm llvm-objcopy \
+                   llvm-objdump llvm-readelf llvm-strip llvm-ranlib llvm-as llvm-size; do
+            [ -x "/usr/lib/llvm-$CLANG_VER/bin/$t" ] && \
+              sudo ln -sf "/usr/lib/llvm-$CLANG_VER/bin/$t" "/usr/local/bin/$t"
+          done
+          clang --version
+          ld.lld --version
+          llvm-ar --version | head -n1
+          clang --version | grep -q "version $CLANG_VER\." \
+            || { echo "Mauvaise version de clang (attendu: $CLANG_VER)"; exit 1; }
+
+      - name: Télécharger et appliquer les patchs KernelSU et SuSFS
+        run: |
+          git clone --depth=1 -b kernel-4.14 https://github.com/nanix06/susfs4ksu.git susfs
+          patch -p1 --fuzz=3 < susfs/kernel_patches/kernelsu-only.patch || true
+          patch -p1 --fuzz=3 < susfs/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
+          patch -p1 --fuzz=3 < susfs/kernel_patches/fix_stat.c.patch || true
+          patch -p1 --fuzz=3 < susfs/kernel_patches/55_try_umount_for_susfs.patch || true
+          sed -i 's/inotify_mark_user_mask(mark)/(mark->mask \& IN_ALL_EVENTS)/g' fs/notify/fdinfo.c
+          sed -i '/^orig_flow:$/a\\t\t;' fs/notify/fdinfo.c
+          sed -i '0,/^static void susfs_run_sus_path_loop(void) {/s//void susfs_run_sus_path_loop(void) {/' fs/susfs.c
+
+      - name: Ajouter KernelSU-Next
+        run: |
+          git clone --depth=1 -b legacy https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          sed -i 's/get_monotonic_boottime(&ts)/ktime_get_boottime_ts64(\&ts)/' KernelSU/kernel/sulog/event.c
+          sed -i 's/selinux_kernel_status_page()/selinux_kernel_status_page(\&selinux_state)/' KernelSU/kernel/feature/selinux_hide.c
+          grep -n selinux_kernel_status_page KernelSU/kernel/feature/selinux_hide.c
+
+          # Patch spécifique à KernelSU
+          cp susfs/kernel_patches/KernelSU/susfs_hook_only_official-legacy.patch KernelSU/
+          cd KernelSU
+          patch -p1 < susfs_hook_only_official-legacy.patch || true
+          cd ..
+
+      - name: Configurer le noyau
+        run: |
+          mkdir -p out
+
+          make O=out ARCH=arm64 \
+            $MAKE_ARGS \
+            "$DEFCONFIG"
+
+          # KernelSU
+          ./scripts/config --file out/.config --enable KSU
+          ./scripts/config --file out/.config --enable CONFIG_KALLSYMS_ALL
+
+          # SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_KSTAT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_OVERLAYFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_TRY_UMOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME_RELEASE
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MAP
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+
+          ./scripts/config --file out/.config \
+            --set-str LOCALVERSION "-NetErnels"
+
+          # Evite le build cassé du compat vDSO avec LLVM
+          ./scripts/config --file out/.config --disable CONFIG_COMPAT_VDSO
+
+          make O=out ARCH=arm64 \
+            $MAKE_ARGS \
+            olddefconfig
+
+      - name: Compiler le noyau
+        run: |
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            $MAKE_ARGS \
+            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-fortify-source"
+
+      - name: Préparer les fichiers
+        run: |
+          mkdir -p release
+          cp out/arch/arm64/boot/Image.gz release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image.gz-dtb release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image release/ 2>/dev/null || true
+          sha256sum release/* > release/SHA256SUMS
+
+      - name: Envoyer l’artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mojito-NetErnels-KernelSU-clang${{ inputs.clang_version }}
+          path: release/
+          if-no-files-found: error
