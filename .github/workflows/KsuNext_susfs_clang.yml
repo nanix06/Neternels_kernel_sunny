@@ -208,9 +208,10 @@ jobs:
           cp patches/Patches/SuSFS_Ksu/susfs_patch_ksunext.patch KernelSU/
           cd KernelSU
           patch -p1 < susfs_patch_ksunext.patch || true
-          if find . -name '*.rej' | grep -q .; then
+          find . -name '*.rej' > /tmp/ksu-rej.txt
+          if [ -s /tmp/ksu-rej.txt ]; then
             echo "ERREUR: hunks rejetés par susfs_patch_ksunext.patch :" >&2
-            find . -name '*.rej' -exec cat {} \;
+            xargs -r cat < /tmp/ksu-rej.txt >&2
             exit 1
           fi
           cd ..
@@ -256,53 +257,62 @@ jobs:
 
       - name: Compiler le noyau
         run: |
+          # KCFLAGS est ajouté en dernier (Makefile:1043 « KBUILD_CFLAGS +=
+          # $(ARCH_CFLAGS) $(KCFLAGS) »), donc ces options écrasent celles du
+          # noyau ajoutées plus haut (Makefile:1006-1018).
+          #
+          # -Wno-incompatible-pointer-types
+          #   Clang >= 15 en fait une erreur par défaut ; un noyau 4.14 en
+          #   contient forcément quelques-unes.
+          #
+          # -Wno-error=strict-prototypes
+          #   Le noyau 4.14 fait « -Werror=strict-prototypes » (Makefile:1009).
+          #   Les sources CAF/vendor déclarent des fonctions sans prototype
+          #   (ex. drivers/misc/wl2866d.c:86 « int f() » au lieu de
+          #   « int f(void) ») : clang 23 refuse. On dégrade en simple
+          #   avertissement au lieu de le supprimer, pour garder l'info dans
+          #   les logs sans casser le build à chaque fichier vendor.
+          #   (Correction à la source possible : ajouter « void » entre les
+          #   parenthèses.)
           make -j"$(nproc)" O=out ARCH=arm64 \
             $MAKE_ARGS \
-            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-fortify-source"
- 
-      - name: Préparer les fichiers (Image, dtb, dtbo.img)
+            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-error=strict-prototypes -Wno-fortify-source"
+
+      - name: Préparer les fichiers
         run: |
           BOOT=out/arch/arm64/boot
           mkdir -p release
- 
-          # Image : obligatoire
-          test -f "$BOOT/Image" || { echo "ERREUR: $BOOT/Image introuvable"; exit 1; }
-          cp "$BOOT/Image" release/Image
+
+          # L'image qui boote est Image.gz-dtb :
+          #   CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE=y + CONFIG_IMG_GZ_DTB=y
+          #   => arch/arm64/Makefile : KBUILD_IMAGE := $(boot)/Image.gz-dtb
+          #   => $(obj)/Image.gz-dtb = Image.gz + $(DTB_OBJS)
+          test -f "$BOOT/Image.gz-dtb" || { echo "ERREUR: $BOOT/Image.gz-dtb introuvable"; exit 1; }
+          cp "$BOOT/Image.gz-dtb" release/
           cp "$BOOT/Image.gz" release/ 2>/dev/null || true
-          cp "$BOOT/Image.gz-dtb" release/ 2>/dev/null || true
- 
-          # dtb : concaténation de tous les .dtb générés (même principe que Image.gz-dtb)
-          find "$BOOT/dts" -name '*.dtb' | sort > /tmp/dtb.list
-          if [ -s /tmp/dtb.list ]; then
-            xargs cat < /tmp/dtb.list > release/dtb
-            echo "dtb : $(wc -l < /tmp/dtb.list) fichier(s) concaténé(s)"
-          else
-            echo "::warning::Aucun .dtb trouvé dans $BOOT/dts"
-          fi
- 
-          # dtbo.img : si absent, on tente de le générer avec la cible du Makefile
-          if [ -z "$(find out -name dtbo.img -print -quit)" ]; then
-            make O=out ARCH=arm64 $MAKE_ARGS dtbo.img || true
-          fi
-          DTBO="$(find out -name dtbo.img -print -quit)"
-          if [ -n "$DTBO" ]; then
-            cp "$DTBO" release/dtbo.img
-          else
-            echo "::warning::dtbo.img introuvable : le zip AnyKernel sera créé sans dtbo"
-          fi
- 
+          cp "$BOOT/Image" release/ 2>/dev/null || true
+
+          # dtb / dtbo.img : volontairement PAS livrés.
+          # Cet arbre ne génère que les dtb de la carte de référence sm6150
+          # (sm6150.dtb + overlays idp/qrd/rumi) : le DTB/DTBO de mojito/sunny
+          # vient du firmware stock. Et AK3 flashe déjà tout seul un dtbo.img
+          # présent dans le zip (write_boot -> flash_generic dtbo), tandis que
+          # flash_generic abandonne si la partition n'existe pas.
+          echo "dtb générés (référence, non livrés) :"
+          find "$BOOT/dts" -name '*.dtb' -printf '  %f\n' | sort
+
           ls -lh release
- 
+
       - name: Créer le zip AnyKernel3
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
           cd ak3
           rm -rf .git .github README.md
- 
+
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=NetErnels KernelSU-Next + SuSFS (Mojito)
+          kernel.string=NetErnels KernelSU-Next + SuSFS (sunny/mojito)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -317,39 +327,45 @@ jobs:
           supported.patchlevels=
           supported.vendorpatchlevels=
           '; }
- 
+
           BLOCK=boot;
           IS_SLOT_DEVICE=auto;
           RAMDISK_COMPRESSION=auto;
           PATCH_VBMETA_FLAG=auto;
- 
+
           . tools/ak3-core.sh;
- 
+
           dump_boot;
           write_boot;
- 
-          # dtbo : flashé uniquement si présent dans le zip
-          if [ -f "$home/dtbo.img" ]; then
-            flash_generic dtbo;
-          fi;
           EOF
- 
-          # Fichiers du kernel à la racine du zip
-          cp ../release/Image .
-          [ -f ../release/dtb ] && cp ../release/dtb . || true
-          [ -f ../release/dtbo.img ] && cp ../release/dtbo.img . || true
- 
-          ZIP="Mojito-NetErnels-KSUNext-susfs-clang${CLANG_VER}-$(date +%Y%m%d).zip"
+
+          # Image.gz-dtb uniquement : AK3 teste les noms dans cet ordre
+          #   zImage zImage-dtb Image Image-dtb Image.gz Image.gz-dtb ...
+          # donc un fichier "Image" dans le zip masquerait Image.gz-dtb.
+          cp ../release/Image.gz-dtb .
+
+          ZIP="sunny-NetErnels-KSUNext-susfs-clang${CLANG_VER}-$(date +%Y%m%d).zip"
           zip -r9 "../release/$ZIP" . -x "*.git*"
           cd ..
- 
-          sha256sum release/* > release/SHA256SUMS
+
+          # Garde-fous : Image.gz-dtb présent, Image absent.
+          # Pas de « | grep -q » : sous « bash -eo pipefail » le lecteur ferme le
+          # tube trop tôt et le producteur meurt en 141 (SIGPIPE).
+          unzip -l "release/$ZIP" > /tmp/zip-list.txt
+          grep -q 'Image\.gz-dtb' /tmp/zip-list.txt \
+            || { echo "ERREUR: Image.gz-dtb absent du zip" >&2; exit 1; }
+          if grep -qE '[[:space:]]Image$' /tmp/zip-list.txt; then
+            echo "ERREUR: Image non compressé présent dans le zip" >&2
+            exit 1
+          fi
+
+          rm -f release/SHA256SUMS
+          ( cd release && sha256sum * > SHA256SUMS )
           ls -lh release
- 
+
       - name: Envoyer l’artefact
         uses: actions/upload-artifact@v4
         with:
-          name: Mojito-NetErnels-KernelSU-clang${{ inputs.clang_version }}
+          name: sunny-NetErnels-KernelSU-clang${{ inputs.clang_version || '23' }}
           path: release/
           if-no-files-found: error
- 
