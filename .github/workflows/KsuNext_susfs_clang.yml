@@ -123,7 +123,7 @@ jobs:
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_KSTAT
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_OVERLAYFS
-          ./scripts/config --file out/.config --enable KSU_SUSFS_TRY_UMOUNT
+          ./scripts/config --file out/.config --disable KSU_SUSFS_TRY_UMOUNT
           ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME_RELEASE
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MAP
           ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
