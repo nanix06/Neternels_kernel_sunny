@@ -274,9 +274,27 @@ jobs:
           #   les logs sans casser le build à chaque fichier vendor.
           #   (Correction à la source possible : ajouter « void » entre les
           #   parenthèses.)
+          #
+          # -Wno-implicit-enum-enum-cast
+          #   Nouveau diagnostic « erreur par défaut » de clang sur les
+          #   conversions entre enums différents en C. qcacld en est truffé :
+          #   drivers/staging/qcacld-3.0/.../hif/src/ce/ce_main.c:2135 fait
+          #   « return A_ERROR; » (A_STATUS) dans une fonction qui renvoie
+          #   QDF_STATUS. En C ce sont des entiers : bloquer n'apporte rien.
+          #   L'option n'existe pas dans les vieux clang et le noyau active
+          #   -Werror=unknown-warning-option (Makefile:520) : on ne l'ajoute
+          #   que si ce clang la connaît.
+          EXTRA=""
+          if clang -Werror=unknown-warning-option -Wno-implicit-enum-enum-cast \
+                   -fsyntax-only -x c /dev/null >/dev/null 2>&1; then
+            EXTRA="-Wno-implicit-enum-enum-cast"
+          else
+            echo "note: -Wimplicit-enum-enum-cast inconnu de ce clang, ignoré"
+          fi
+
           make -j"$(nproc)" O=out ARCH=arm64 \
             $MAKE_ARGS \
-            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-error=strict-prototypes -Wno-fortify-source"
+            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-error=strict-prototypes -Wno-fortify-source $EXTRA"
 
       - name: Préparer les fichiers
         run: |
