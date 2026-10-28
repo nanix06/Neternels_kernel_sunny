@@ -75,8 +75,12 @@ jobs:
           done
           clang --version
           ld.lld --version
-          llvm-ar --version | head -n1
-          clang --version | grep -q "version $CLANG_VER\." \
+          # Pas de tube avec head/grep -q : ils ferment le tube trop tôt et LLVM
+          # plante avec "IO failure on output stream: Broken pipe" (pipefail).
+          llvm-ar --version > /tmp/llvm-ar-version.txt
+          head -n1 /tmp/llvm-ar-version.txt
+          clang --version > /tmp/clang-version.txt
+          grep -q "version $CLANG_VER\." /tmp/clang-version.txt \
             || { echo "Mauvaise version de clang (attendu: $CLANG_VER)"; exit 1; }
 
       - name: Télécharger et appliquer les patchs KernelSU et SuSFS
@@ -175,7 +179,7 @@ jobs:
           ./scripts/config --file out/.config --enable KSU
           ./scripts/config --file out/.config --enable CONFIG_KALLSYMS_ALL
 
-          # SUSFS 
+          # SUSFS (SUS_MOUNT désactivé comme dans wc : compatibilité magic mount / modules)
           ./scripts/config --file out/.config --enable KSU_SUSFS
           ./scripts/config --file out/.config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
