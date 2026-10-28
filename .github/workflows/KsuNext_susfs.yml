@@ -2,6 +2,11 @@ name: Mojito - NetErnels-KSUNext-susfs
 
 on:
   workflow_dispatch:
+    inputs:
+      boot_url:
+        description: "URL du boot.img stock PixelOS a patcher"
+        required: false
+        default: "https://download.pixelos.net/seventeen/sunny/recovery/boot-sunny_20261028_0537.img"
 
 permissions:
   contents: read
@@ -25,6 +30,16 @@ jobs:
           ref: staging
           fetch-depth: 1
           submodules: recursive
+
+      - name: Télécharger le boot.img stock (PixelOS)
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          # Téléchargé AVANT le build : une URL morte échoue en 10 s au lieu de
+          # 40 min de compilation.
+          curl -fL --retry 3 --retry-delay 2 -o stock-boot.img "$BOOT_URL"
+          echo "taille    : $(stat -c%s stock-boot.img) octets"
+          test "$(head -c8 stock-boot.img)" = "ANDROID!" && echo "magic     : ANDROID!"
 
       - name: Installer les dépendances
         run: |
@@ -108,7 +123,7 @@ jobs:
           ./scripts/config --file out/.config --enable KSU_SUSFS
           ./scripts/config --file out/.config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
-          ./scripts/config --file out/.config --disable KSU_SUSFS_SUS_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MOUNT
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_KSTAT
           ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_OVERLAYFS
           ./scripts/config --file out/.config --enable KSU_SUSFS_TRY_UMOUNT
@@ -152,6 +167,97 @@ jobs:
           cp out/arch/arm64/boot/Image.gz-dtb release/ 2>/dev/null || true
           cp out/arch/arm64/boot/Image release/ 2>/dev/null || true
           sha256sum release/* > release/SHA256SUMS
+
+      - name: Générer le boot.img patché (PixelOS + NetErnels)
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          test -f out/arch/arm64/boot/Image || { echo "ERREUR: out/arch/arm64/boot/Image absent"; exit 1; }
+          grep -aq 'KernelSU' out/arch/arm64/boot/Image || { echo "ERREUR: KernelSU absent du noyau compile"; exit 1; }
+
+          BOOT_OUT=release/boot-sunny-KSU-NetErnels.img
+
+          # Repack du boot PixelOS : on garde header, ramdisk, cmdline et
+          # os_version du ROM, on ne remplace QUE la section kernel.
+          # Ce boot est en header v4 (1584 o, page 4096) avec une Image arm64
+          # NON compressee et aucun DTB dedans (le DTB est dans vendor_boot,
+          # qui n'est pas touche).
+          python3 - stock-boot.img out/arch/arm64/boot/Image "$BOOT_OUT" <<'PY'
+          import hashlib, struct, sys
+
+          src, kpath, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+          PAGE = 4096
+
+          def align(n):
+              return (n + PAGE - 1) // PAGE * PAGE
+
+          img = open(src, "rb").read()
+          if img[:8] != b"ANDROID!":
+              sys.exit("boot stock: magic ANDROID! absent")
+
+          hv  = struct.unpack_from("<I", img, 40)[0]
+          hsz = struct.unpack_from("<I", img, 20)[0]
+          ks  = struct.unpack_from("<I", img, 8)[0]
+          rs  = struct.unpack_from("<I", img, 12)[0]
+          osv = struct.unpack_from("<I", img, 16)[0]
+
+          if hv not in (3, 4):
+              sys.exit("header_version %d non gere (attendu 3 ou 4)" % hv)
+
+          ram_off = PAGE + align(ks)
+          if ram_off + rs > len(img):
+              sys.exit("ramdisk hors image: header incoherent")
+
+          ramdisk = img[ram_off:ram_off + rs]
+          kern = open(kpath, "rb").read()
+
+          if img[PAGE + 0x38:PAGE + 0x3C] != b"ARM\x64":
+              print("ATTENTION: le noyau stock n'est pas une Image arm64")
+          if kern[0x38:0x3C] != b"ARM\x64":
+              sys.exit("le noyau fourni n'est pas une Image arm64")
+
+          hdr = bytearray(img[:PAGE])
+          struct.pack_into("<I", hdr, 8, len(kern))        # kernel_size
+          struct.pack_into("<I", hdr, 12, len(ramdisk))    # ramdisk_size
+          if hv == 4:
+              struct.pack_into("<I", hdr, 1580, 0)         # signature_size = 0
+
+          new_ram_off = PAGE + align(len(kern))
+          out = bytes(hdr) + kern + b"\0" * (new_ram_off - PAGE - len(kern))
+          out += ramdisk + b"\0" * (align(len(ramdisk)) - len(ramdisk))
+          open(dst, "wb").write(out)
+
+          # relecture pour verifier que rien n'a bouge a part le noyau
+          chk = open(dst, "rb").read()
+          nks = struct.unpack_from("<I", chk, 8)[0]
+          nrs = struct.unpack_from("<I", chk, 12)[0]
+          nro = PAGE + align(nks)
+          assert chk[:8] == b"ANDROID!" and chk[PAGE:PAGE + nks] == kern
+          assert chk[nro:nro + nrs] == ramdisk and len(chk) % PAGE == 0
+          assert chk[16:20] == img[16:20] and chk[44:1580] == img[44:1580]
+
+          print("header   : v%d (header_size=%d)  os_version=0x%08x" % (hv, hsz, osv))
+          print("noyau    : %d o (stock %d o)" % (len(kern), ks))
+          print("ramdisk  : %d o a l'offset 0x%x (inchange)" % (nrs, nro))
+          print("image    : %d o (%.2f MiB)" % (len(chk), len(chk) / 1048576.0))
+          print("sha256   : " + hashlib.sha256(chk).hexdigest())
+          print("OK: ramdisk / cmdline / os_version identiques au stock")
+          PY
+
+          cd release
+          sha256sum $(ls -1 | grep -v '^SHA256SUMS$') > SHA256SUMS
+          cat SHA256SUMS
+
+          {
+            echo "### boot.img patché"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| ROM source | $BOOT_URL |"
+            echo "| fichier | \`boot-sunny-KSU-NetErnels.img\` |"
+            echo "| taille | $(stat -c%s boot-sunny-KSU-NetErnels.img) octets |"
+            echo "| sha256 | \`$(sha256sum boot-sunny-KSU-NetErnels.img | cut -d' ' -f1)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Envoyer l’artefact
         uses: actions/upload-artifact@v4
