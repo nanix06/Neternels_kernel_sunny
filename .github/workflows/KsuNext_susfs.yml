@@ -47,6 +47,29 @@ jobs:
           sed -i '/^orig_flow:$/a\\t\t;' fs/notify/fdinfo.c
           sed -i '0,/^static void susfs_run_sus_path_loop(void) {/s//void susfs_run_sus_path_loop(void) {/' fs/susfs.c
 
+      - name: Corriger l'injection initrc (hooks newfstat/fstat64 manquants)
+        run: |
+          # kernelsu-only.patch ne hooke que newfstatat et fstatat64
+          # (-> ksu_handle_stat). Il manque deux appels :
+          #   newfstat -> ksu_handle_newfstat_ret   (fstat() sur un fd)
+          #   fstat64  -> ksu_handle_fstat64_ret    (compat 32 bits)
+          # Or init ouvre init.rc puis fait un fstat() dessus. Sans ces hooks il
+          # ne voit pas la taille « reelle + ajoutee », donc il ne lit jamais le
+          # bloc KERNEL_SU_RC / modules.rc, ksud post-fs-data n'est jamais lance
+          # et les modules KernelSU ne montent pas au boot.
+          git clone --depth=1 -b main https://github.com/nanix06/Patch_Ksu_SuSFS.git patch_ksu
+          FIX=patch_ksu/Patches/Fix/patch_ksu_initrc_newfstat.patch
+          test -f "$FIX" || { echo "ERREUR: $FIX absent"; exit 1; }
+
+          # git apply (et pas GNU patch) : le hunk fstat64 a 7 lignes de contexte
+          # avant et 2 apres, que GNU patch prend pour une ancre de fin de fichier
+          # et rejette ("Hunk #2 FAILED at 523").
+          git apply --verbose "$FIX"
+
+          grep -q 'ksu_handle_newfstat_ret' fs/stat.c
+          grep -q 'ksu_handle_fstat64_ret' fs/stat.c
+          echo "OK: hooks newfstat/fstat64 presents dans fs/stat.c"
+
       - name: Ajouter KernelSU-Next
         run: |
           git clone --depth=1 -b legacy https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU
