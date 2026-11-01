@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       boot_url:
-        description: "URL du boot.img stock PixelOS a patcher"
+        description: "URL du boot.img a patcher"
         required: false
         default: "https://download947.mediafire.com/va3eqzj9oazgDH2Nxvf1xzZzYKGQXY8vRFi2U06V91y0jOZh3Fw6xN7yrHFw6eO53Susfo-dcyQM7C3qW_D7oqAMo_1fchODQifUMjqFNcNT_JNR4sjFf5lS1GrploA-LB4_vb11yCRzIMErSCkqg9dof_Hnklxqhux8tcPrarDgZ3k/cvwzdnae048dlgc/boot.img"
 
@@ -31,7 +31,7 @@ jobs:
           fetch-depth: 1
           submodules: recursive
 
-      - name: Télécharger le boot.img stock (PixelOS)
+      - name: Télécharger le boot.img
         env:
           BOOT_URL: ${{ inputs.boot_url }}
         run: |
@@ -168,7 +168,7 @@ jobs:
           cp out/arch/arm64/boot/Image release/ 2>/dev/null || true
           sha256sum release/* > release/SHA256SUMS
 
-      - name: Générer le boot.img patché (PixelOS + NetErnels)
+      - name: Générer le boot.img patché
         env:
           BOOT_URL: ${{ inputs.boot_url }}
         run: |
@@ -262,6 +262,6 @@ jobs:
       - name: Envoyer l’artefact
         uses: actions/upload-artifact@v4
         with:
-          name: Mojito-NetErnels-KernelSU
+          name: NetErnels-KsuNext-Susfs
           path: release/
           if-no-files-found: error
