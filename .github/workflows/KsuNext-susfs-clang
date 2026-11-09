@@ -1,0 +1,298 @@
+name: NetErnels-KSUNext-susfs-clang
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_url:
+        description: "URL du boot.img a patcher"
+        required: false
+        default: "https://download.pixelos.net/seventeen/sunny/recovery/boot-sunny_20261028_0537.img"
+
+permissions:
+  contents: read
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  DEFCONFIG: neternels_defconfig
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+  CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+  # ZyC Clang 23 (dernier build 23.x disponible)
+  ZYC_CLANG_VERSION: "23.0.0git-20260130"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Télécharger le source
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Télécharger le boot.img
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          # Téléchargé AVANT le build : une URL morte échoue en 10 s au lieu de
+          # 40 min de compilation.
+          curl -fL --retry 3 --retry-delay 2 -o stock-boot.img "$BOOT_URL"
+          echo "taille    : $(stat -c%s stock-boot.img) octets"
+          test "$(head -c8 stock-boot.img)" = "ANDROID!" && echo "magic     : ANDROID!"
+
+      - name: Installer les dépendances
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache flex git libssl-dev \
+            libelf-dev pahole python3 rsync unzip wget zip \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi \
+            libncurses5 libtinfo5 libxml2
+
+      # Clang 23 (LLVM 23) n'est pas disponible dans les depots Ubuntu 22.04 :
+      # on utilise le build ZyC, qui embarque clang + lld + binutils LLVM.
+      - name: Installer ZyC Clang 23
+        run: |
+          URL="https://github.com/ZyCromerZ/Clang/releases/download/${ZYC_CLANG_VERSION}-release/Clang-${ZYC_CLANG_VERSION}.tar.gz"
+          curl -fL --retry 3 --retry-delay 2 -o clang.tar.gz "$URL"
+
+          mkdir -p clang
+
+          # Selon les builds, l'archive contient (ou non) un dossier racine :
+          # on ne retire ce niveau que si bin/clang se trouve juste dessous.
+          top=$(tar -tzf clang.tar.gz | head -n1 | cut -d/ -f1)
+          strip=0
+          if tar -tzf clang.tar.gz | grep -qx "${top}/bin/clang"; then
+            strip=1
+          fi
+          tar -xzf clang.tar.gz -C clang --strip-components="$strip"
+          rm clang.tar.gz
+
+          test -x clang/bin/clang || { echo "ERREUR: clang/bin/clang absent apres extraction"; exit 1; }
+          test -x clang/bin/llvm-ar || { echo "ERREUR: llvm-ar absent (LLVM=1 en a besoin)"; exit 1; }
+          clang/bin/clang --version
+          clang/bin/ld.lld --version
+
+          # PATH persistant pour toutes les etapes suivantes (configure + build)
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+ 
+      - name: Télécharger et appliquer les patchs KernelSU et SuSFS
+        run: |
+          git clone --depth=1 -b main https://github.com/nanix06/Patch_Ksu_SuSFS.git patches
+          patch -p1 --fuzz=3 < patches/Patches/SU_kernel/patch_ksunext.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SuSFS_Kernel/50_add_susfs_in_kernel-4.14.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/Fix/susfs_fix_statc.patch || true
+          patch -p1 --fuzz=3 < patches/Patches/SuSFS_Kernel/55_try_umount_for_susfs.patch || true
+          sed -i 's/inotify_mark_user_mask(mark)/(mark->mask \& IN_ALL_EVENTS)/g' fs/notify/fdinfo.c
+          sed -i '/^orig_flow:$/a\\t\t;' fs/notify/fdinfo.c
+          sed -i '0,/^static void susfs_run_sus_path_loop(void) {/s//void susfs_run_sus_path_loop(void) {/' fs/susfs.c
+
+      - name: Corriger l'injection initrc (hooks newfstat/fstat64 manquants)
+        run: |
+          # kernelsu-only.patch ne hooke que newfstatat et fstatat64
+          # (-> ksu_handle_stat). Il manque deux appels :
+          #   newfstat -> ksu_handle_newfstat_ret   (fstat() sur un fd)
+          #   fstat64  -> ksu_handle_fstat64_ret    (compat 32 bits)
+          # Or init ouvre init.rc puis fait un fstat() dessus. Sans ces hooks il
+          # ne voit pas la taille « reelle + ajoutee », donc il ne lit jamais le
+          # bloc KERNEL_SU_RC / modules.rc, ksud post-fs-data n'est jamais lance
+          # et les modules KernelSU ne montent pas au boot.
+          git clone --depth=1 -b main https://github.com/nanix06/Patch_Ksu_SuSFS.git patch_ksu
+          FIX=patch_ksu/Patches/Fix/patch_ksu_initrc_newfstat.patch
+          test -f "$FIX" || { echo "ERREUR: $FIX absent"; exit 1; }
+
+          # git apply (et pas GNU patch) : le hunk fstat64 a 7 lignes de contexte
+          # avant et 2 apres, que GNU patch prend pour une ancre de fin de fichier
+          # et rejette ("Hunk #2 FAILED at 523").
+          git apply --verbose "$FIX"
+
+          grep -q 'ksu_handle_newfstat_ret' fs/stat.c
+          grep -q 'ksu_handle_fstat64_ret' fs/stat.c
+          echo "OK: hooks newfstat/fstat64 presents dans fs/stat.c"
+
+      - name: Ajouter KernelSU-Next
+        run: |
+          git clone --depth=1 -b legacy https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          sed -i 's/get_monotonic_boottime(&ts)/ktime_get_boottime_ts64(\&ts)/' KernelSU/kernel/sulog/event.c
+          sed -i 's/selinux_kernel_status_page()/selinux_kernel_status_page(\&selinux_state)/' KernelSU/kernel/feature/selinux_hide.c
+          grep -n selinux_kernel_status_page KernelSU/kernel/feature/selinux_hide.c
+
+          # Patch spécifique à KernelSU
+          cp patches/Patches/SuSFS_Ksu/susfs_patch_ksunext.patch KernelSU/
+          cd KernelSU
+          patch -p1 < susfs_patch_ksunext.patch || true
+          cd ..
+
+      - name: Configurer le noyau
+        run: |
+          # PATH (ZyC Clang 23) deja injecte via GITHUB_PATH
+          clang --version | head -n1
+          ld.lld --version | head -n1
+
+          mkdir -p out
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            "$DEFCONFIG"
+
+          # KernelSU
+          ./scripts/config --file out/.config --enable KSU
+          ./scripts/config --file out/.config --enable CONFIG_KALLSYMS_ALL
+
+          # SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_HAS_MAGIC_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_PATH
+          ./scripts/config --file out/.config --disable KSU_SUSFS_SUS_MOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_KSTAT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_OVERLAYFS
+          ./scripts/config --file out/.config --enable KSU_SUSFS_TRY_UMOUNT
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_UNAME_RELEASE
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SUS_MAP
+          ./scripts/config --file out/.config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          
+
+          ./scripts/config --file out/.config \
+            --set-str LOCALVERSION "-NetErnels"
+
+          # Evite le build cassé du compat vDSO avec LLVM
+          ./scripts/config --file out/.config --disable CONFIG_COMPAT_VDSO
+
+          make O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            olddefconfig
+            
+      - name: Compiler le noyau
+        run: |
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
+            CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
+            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-fortify-source" \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      - name: Préparer les fichiers
+        run: |
+          mkdir -p release
+          cp out/arch/arm64/boot/Image.gz release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image.gz-dtb release/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image release/ 2>/dev/null || true
+          sha256sum release/* > release/SHA256SUMS
+
+      - name: Générer le boot.img patché
+        env:
+          BOOT_URL: ${{ inputs.boot_url }}
+        run: |
+          test -f out/arch/arm64/boot/Image || { echo "ERREUR: out/arch/arm64/boot/Image absent"; exit 1; }
+          grep -aq 'KernelSU' out/arch/arm64/boot/Image || { echo "ERREUR: KernelSU absent du noyau compile"; exit 1; }
+
+          BOOT_OUT=release/boot-sunny-KSU-NetErnels.img
+
+          # Repack du boot PixelOS : on garde header, ramdisk, cmdline et
+          # os_version du ROM, on ne remplace QUE la section kernel.
+          # Ce boot est en header v4 (1584 o, page 4096) avec une Image arm64
+          # NON compressee et aucun DTB dedans (le DTB est dans vendor_boot,
+          # qui n'est pas touche).
+          python3 - stock-boot.img out/arch/arm64/boot/Image "$BOOT_OUT" <<'PY'
+          import hashlib, struct, sys
+
+          src, kpath, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+          PAGE = 4096
+
+          def align(n):
+              return (n + PAGE - 1) // PAGE * PAGE
+
+          img = open(src, "rb").read()
+          if img[:8] != b"ANDROID!":
+              sys.exit("boot stock: magic ANDROID! absent")
+
+          hv  = struct.unpack_from("<I", img, 40)[0]
+          hsz = struct.unpack_from("<I", img, 20)[0]
+          ks  = struct.unpack_from("<I", img, 8)[0]
+          rs  = struct.unpack_from("<I", img, 12)[0]
+          osv = struct.unpack_from("<I", img, 16)[0]
+
+          if hv not in (3, 4):
+              sys.exit("header_version %d non gere (attendu 3 ou 4)" % hv)
+
+          ram_off = PAGE + align(ks)
+          if ram_off + rs > len(img):
+              sys.exit("ramdisk hors image: header incoherent")
+
+          ramdisk = img[ram_off:ram_off + rs]
+          kern = open(kpath, "rb").read()
+
+          if img[PAGE + 0x38:PAGE + 0x3C] != b"ARM\x64":
+              print("ATTENTION: le noyau stock n'est pas une Image arm64")
+          if kern[0x38:0x3C] != b"ARM\x64":
+              sys.exit("le noyau fourni n'est pas une Image arm64")
+
+          hdr = bytearray(img[:PAGE])
+          struct.pack_into("<I", hdr, 8, len(kern))        # kernel_size
+          struct.pack_into("<I", hdr, 12, len(ramdisk))    # ramdisk_size
+          if hv == 4:
+              struct.pack_into("<I", hdr, 1580, 0)         # signature_size = 0
+
+          new_ram_off = PAGE + align(len(kern))
+          out = bytes(hdr) + kern + b"\0" * (new_ram_off - PAGE - len(kern))
+          out += ramdisk + b"\0" * (align(len(ramdisk)) - len(ramdisk))
+          open(dst, "wb").write(out)
+
+          # relecture pour verifier que rien n'a bouge a part le noyau
+          chk = open(dst, "rb").read()
+          nks = struct.unpack_from("<I", chk, 8)[0]
+          nrs = struct.unpack_from("<I", chk, 12)[0]
+          nro = PAGE + align(nks)
+          assert chk[:8] == b"ANDROID!" and chk[PAGE:PAGE + nks] == kern
+          assert chk[nro:nro + nrs] == ramdisk and len(chk) % PAGE == 0
+          assert chk[16:20] == img[16:20] and chk[44:1580] == img[44:1580]
+
+          print("header   : v%d (header_size=%d)  os_version=0x%08x" % (hv, hsz, osv))
+          print("noyau    : %d o (stock %d o)" % (len(kern), ks))
+          print("ramdisk  : %d o a l'offset 0x%x (inchange)" % (nrs, nro))
+          print("image    : %d o (%.2f MiB)" % (len(chk), len(chk) / 1048576.0))
+          print("sha256   : " + hashlib.sha256(chk).hexdigest())
+          print("OK: ramdisk / cmdline / os_version identiques au stock")
+          PY
+
+          cd release
+          sha256sum $(ls -1 | grep -v '^SHA256SUMS$') > SHA256SUMS
+          cat SHA256SUMS
+
+          {
+            echo "### boot.img patché"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| ROM source | $BOOT_URL |"
+            echo "| fichier | \`boot-sunny-KSU-NetErnels.img\` |"
+            echo "| taille | $(stat -c%s boot-sunny-KSU-NetErnels.img) octets |"
+            echo "| sha256 | \`$(sha256sum boot-sunny-KSU-NetErnels.img | cut -d' ' -f1)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Envoyer l’artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetErnels-KsuNext-Susfs
+          path: release/
+          if-no-files-found: error
