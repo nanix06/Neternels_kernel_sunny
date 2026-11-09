@@ -1,4 +1,4 @@
-name: NetErnels-KSUNext-susfs-clang
+name: Mojito - NetErnels-KSUNext-susfs
 
 on:
   workflow_dispatch:
@@ -90,6 +90,9 @@ jobs:
           sed -i 's/inotify_mark_user_mask(mark)/(mark->mask \& IN_ALL_EVENTS)/g' fs/notify/fdinfo.c
           sed -i '/^orig_flow:$/a\\t\t;' fs/notify/fdinfo.c
           sed -i '0,/^static void susfs_run_sus_path_loop(void) {/s//void susfs_run_sus_path_loop(void) {/' fs/susfs.c
+
+          # Declarations a l'ancienne rejetees par clang 23 (-Werror=strict-prototypes)
+          sed -i 's/^int wl2866d_camera_power_down_all()$/int wl2866d_camera_power_down_all(void)/' drivers/misc/wl2866d.c
 
       - name: Corriger l'injection initrc (hooks newfstat/fstat64 manquants)
         run: |
@@ -187,7 +190,7 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
             CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
-            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-fortify-source" \
+            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-fortify-source -Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-mismatch -Wno-error=date-time -Wno-error=designated-init" \
             LLVM=1 \
             LLVM_IAS=1
 
