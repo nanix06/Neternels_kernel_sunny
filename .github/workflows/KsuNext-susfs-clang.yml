@@ -1,4 +1,4 @@
-name: NetErnels-KSUNext-susfs-clang
+name: Mojito - NetErnels-KSUNext-susfs
 
 on:
   workflow_dispatch:
@@ -190,7 +190,7 @@ jobs:
             CROSS_COMPILE="$CROSS_COMPILE" \
             CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
             CROSS_COMPILE_COMPAT="$CROSS_COMPILE_COMPAT" \
-            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-fortify-source -Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-mismatch -Wno-error=date-time" \
+            KCFLAGS="-Wno-visibility -Wno-unused-but-set-variable -Wno-int-conversion -Wno-fortify-source -Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=incompatible-function-pointer-types -Wno-error=return-mismatch -Wno-error=date-time -Wno-error -Wno-implicit-enum-enum-cast" \
             LLVM=1 \
             LLVM_IAS=1
 
