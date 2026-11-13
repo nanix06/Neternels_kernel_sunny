@@ -6,7 +6,7 @@ on:
       boot_url:
         description: "URL du boot.img a patcher"
         required: false
-        default: "https://download.pixelos.net/seventeen/sunny/recovery/boot-sunny_20261028_0537.img"
+        default: "https://download.pixelos.net/seventeen/sunny/recovery/boot-sunny_20261112_2328.img"
 
 permissions:
   contents: read
